@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const pool = require('./db');
 const gw = require('./gateway');
+const { sendWhatsApp } = require('./notify');
 
 const r = express.Router();
 const BANKS = ['BCA', 'BNI', 'BRI', 'MANDIRI'];
@@ -57,8 +58,12 @@ r.post('/order', rateLimit({ windowMs: 60000, max: 10, standardHeaders: true, le
        VALUES (?,?,?,?,?,?,?,?,?,?)`,
       [orderId, p.partnerRef, v.method, v.bank, p.vaNumber || null, p.qrString || null, p.qrImageUrl || null, amount, p.expiredAt, JSON.stringify(p.raw || {})]);
 
-    res.json({ success: true, data: { order_id: orderId, total: amount, expired_at: p.expiredAt.toISOString(),
-      bank: v.bank, va_number: p.vaNumber, qr_string: p.qrString, qr_image_url: p.qrImageUrl } });
+    res.json({
+      success: true, data: {
+        order_id: orderId, total: amount, expired_at: p.expiredAt.toISOString(),
+        bank: v.bank, va_number: p.vaNumber, qr_string: p.qrString, qr_image_url: p.qrImageUrl
+      }
+    });
   } catch (e) {
     console.error(e); res.status(500).json({ success: false, message: 'Terjadi kesalahan server' });
   }
@@ -92,15 +97,24 @@ async function markPaid(partnerRef, amount, logResult) {
 }
 
 async function notifyPaid(orderId) {
-  // TODO: kirim WhatsApp konfirmasi ke pemesan & admin (mis. Twilio template seperti proyek lain).
-  console.log('[paid]', orderId);
+  const [[o]] = await pool.query('SELECT * FROM rental_orders WHERE order_id=?', [orderId]);
+  if (!o) return;
+  const tgl = o.usage_date.split('-').reverse().join('/'), jam = o.pickup_time.slice(0, 5);
+  const total = 'Rp ' + Number(o.total_amount).toLocaleString('id-ID');
+  // Urutan variabel template Twilio: {{1}} nama, {{2}} no. pesanan, {{3}} mobil, {{4}} jadwal, {{5}} total
+  const vars = { 1: o.customer_name, 2: o.order_id, 3: o.car_name, 4: `${tgl} ${jam}`, 5: total };
+  const body = `Pembayaran berhasil ✅\nNo. Pesanan: ${o.order_id}\nNama: ${o.customer_name}\nMobil: ${o.car_name}\nJadwal: ${tgl} ${jam}\nJemput: ${o.pickup_location}\nTujuan: ${o.destination}\nTotal: ${total}\n\nTerima kasih, LinkU.`;
+  const admins = (process.env.ADMIN_WA || '').split(',').map(x => x.trim()).filter(Boolean);
+  const targets = [o.whatsapp, ...admins];
+  const rs = await Promise.allSettled(targets.map(t => sendWhatsApp(t, { vars, body })));
+  rs.forEach((x, i) => { if (x.status === 'rejected') console.error('[wa] gagal kirim ke ...' + String(targets[i]).slice(-4) + ':', x.reason.message); });
 }
 
 // ---- Callback dari payment gateway ----
 r.post('/callback', async (req, res) => {
   const log = (partnerRef, verified, result, payload) =>
     pool.query('INSERT INTO rental_webhook_logs (partner_ref, verified, result, payload) VALUES (?,?,?,?)',
-      [partnerRef || null, verified ? 1 : 0, result, JSON.stringify(payload || {})]).catch(() => {});
+      [partnerRef || null, verified ? 1 : 0, result, JSON.stringify(payload || {})]).catch(() => { });
   try {
     if (!gw.verifyCallback(req)) { await log(null, false, 'bad_signature', req.body); return res.status(401).json({ success: false }); }
     const ev = gw.parseCallback(req.body || {});

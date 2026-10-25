@@ -1,5 +1,8 @@
 const mysql = require('mysql2/promise');
 
+const missing = ['DB_HOST', 'DB_USER', 'DB_NAME'].filter(k => !process.env[k]);
+if (missing.length) console.error(`⚠️  Variabel belum terbaca: ${missing.join(', ')} (cek Environment Variables)`);
+
 const pool = mysql.createPool({
   host: process.env.DB_HOST, port: +process.env.DB_PORT || 3306,
   user: process.env.DB_USER, password: process.env.DB_PASSWORD, database: process.env.DB_NAME,
