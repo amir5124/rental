@@ -96,18 +96,31 @@ async function markPaid(partnerRef, amount, logResult) {
   return logResult('ok', 200);
 }
 
+// ---- Notifikasi WhatsApp: template pelanggan & admin (urutan variabel = urutan {{n}} di template Twilio) ----
 async function notifyPaid(orderId) {
   const [[o]] = await pool.query('SELECT * FROM rental_orders WHERE order_id=?', [orderId]);
   if (!o) return;
   const tgl = o.usage_date.split('-').reverse().join('/'), jam = o.pickup_time.slice(0, 5);
   const total = 'Rp ' + Number(o.total_amount).toLocaleString('id-ID');
-  // Urutan variabel template Twilio: {{1}} nama, {{2}} no. pesanan, {{3}} mobil, {{4}} jadwal, {{5}} total
-  const vars = { 1: o.customer_name, 2: o.order_id, 3: o.car_name, 4: `${tgl} ${jam}`, 5: total };
-  const body = `Pembayaran berhasil ✅\nNo. Pesanan: ${o.order_id}\nNama: ${o.customer_name}\nMobil: ${o.car_name}\nJadwal: ${tgl} ${jam}\nJemput: ${o.pickup_location}\nTujuan: ${o.destination}\nTotal: ${total}\n\nTerima kasih, LinkU.`;
-  const admins = (process.env.ADMIN_WA || '').split(',').map(x => x.trim()).filter(Boolean);
-  const targets = [o.whatsapp, ...admins];
-  const rs = await Promise.allSettled(targets.map(t => sendWhatsApp(t, { vars, body })));
-  rs.forEach((x, i) => { if (x.status === 'rejected') console.error('[wa] gagal kirim ke ...' + String(targets[i]).slice(-4) + ':', x.reason.message); });
+  const jadwal = `${tgl} ${jam}`;
+
+  // Template pelanggan: {{1}} nama, {{2}} no. pesanan, {{3}} mobil, {{4}} jadwal, {{5}} jemput, {{6}} tujuan, {{7}} total
+  const customerVars = { 1: o.customer_name, 2: o.order_id, 3: o.car_name, 4: jadwal, 5: o.pickup_location, 6: o.destination, 7: total };
+  // Template admin: {{1}} no. pesanan, {{2}} nama, {{3}} WA, {{4}} mobil, {{5}} jadwal, {{6}} jemput, {{7}} tujuan, {{8}} penumpang, {{9}} catatan, {{10}} total
+  const adminVars = { 1: o.order_id, 2: o.customer_name, 3: o.whatsapp, 4: o.car_name, 5: jadwal, 6: o.pickup_location, 7: o.destination, 8: o.passengers, 9: o.notes, 10: total };
+
+  // Cadangan teks biasa bila SID template tidak diisi
+  const body = `Pembayaran berhasil ✅\nNo. Pesanan: ${o.order_id}\nNama: ${o.customer_name}\nMobil: ${o.car_name}\nJadwal: ${jadwal}\nJemput: ${o.pickup_location}\nTujuan: ${o.destination}\nTotal: ${total}\n\nTerima kasih, LinkU.`;
+
+  const admins = (process.env.ADMIN_WA || '6281347423737').split(',').map(x => x.trim()).filter(Boolean);
+  const jobs = [
+    { to: o.whatsapp, vars: customerVars, role: 'customer' },
+    ...admins.map(to => ({ to, vars: adminVars, role: 'admin' }))
+  ];
+  const rs = await Promise.allSettled(jobs.map(j => sendWhatsApp(j.to, { vars: j.vars, body, role: j.role })));
+  rs.forEach((x, i) => {
+    if (x.status === 'rejected') console.error('[wa] gagal kirim ke ...' + String(jobs[i].to).slice(-4) + ' (' + jobs[i].role + '):', x.reason.message);
+  });
 }
 
 // ---- Callback dari payment gateway ----
