@@ -75,16 +75,36 @@ async function createPayment({ orderId, amount, method, bank, customer }) {
     customer_id: customerId, customer_name: customerName, customer_email: customerEmail
   };
 
-  const res = await fetch(cfg.baseUrl + '/linkqu-partner' + urlPath, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'client-id': cfg.clientId, 'client-secret': cfg.clientSecret },
-    body: JSON.stringify(payload)
-  });
-  const j = await res.json().catch(() => ({}));
+  // Log request: pin, signature, & kredensial TIDAK dicetak
+  console.log('[gateway:create] REQUEST', JSON.stringify({
+    order: orderId, method, bank, url: cfg.baseUrl + '/linkqu-partner' + urlPath,
+    amount, partner_reff: partnerRef, expired, url_callback: cfg.callbackUrl,
+    bank_code: extra.bank_code, customer_id: customerId, customer_name: customerName, customer_email: customerEmail
+  }));
+
+  const t0 = Date.now();
+  let res, j;
+  try {
+    res = await fetch(cfg.baseUrl + '/linkqu-partner' + urlPath, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'client-id': cfg.clientId, 'client-secret': cfg.clientSecret },
+      body: JSON.stringify(payload)
+    });
+    j = await res.json().catch(() => ({}));
+  } catch (e) {
+    console.error('[gateway:create] NETWORK ERROR', orderId, e.message);
+    throw e;
+  }
+  console.log('[gateway:create] RESPONSE', JSON.stringify({ order: orderId, http: res.status, ms: Date.now() - t0, body: j }));
+
   const vaNumber = j.virtual_account || undefined;
   const qrImageUrl = j.imageqris ? String(j.imageqris).trim() : undefined;
   const ok = res.ok && (method === 'QRIS' ? qrImageUrl : vaNumber);
-  if (!ok) throw new Error('LinkQu ' + res.status + ': ' + (j.message || j.response_desc || JSON.stringify(j).slice(0, 200)));
+  if (!ok) {
+    console.error('[gateway:create] GAGAL', orderId, 'http=' + res.status);
+    throw new Error('LinkQu ' + res.status + ': ' + (j.message || j.response_desc || JSON.stringify(j).slice(0, 200)));
+  }
+  console.log('[gateway:create] OK', JSON.stringify({ order: orderId, partnerRef, va: vaNumber, qris: !!qrImageUrl }));
 
   return { partnerRef, vaNumber, qrString: j.qris_string || j.qris || undefined, qrImageUrl, expiredAt, raw: j };
 }
@@ -93,6 +113,7 @@ async function createPayment({ orderId, amount, method, bank, customer }) {
 // Isinya: { partner_reff, va_code, serialnumber, ... } dan hanya dikirim saat pembayaran sukses.
 // Keamanan: partnerRef acak & rahasia + cek nominal/duplikat di markPaid().
 function verifyCallback(req) {
+  console.log('[gateway:callback] DITERIMA', JSON.stringify({ ip: req.ip, body: req.body }));
   return true;
 }
 
@@ -104,6 +125,7 @@ function parseCallback(body) {
   else if (['PAID', 'SUCCESS', 'SUKSES', 'SETTLED'].includes(s)) status = 'PAID';
   else if (s === 'EXPIRED') status = 'EXPIRED';
   else if (['FAILED', 'CANCELLED', 'GAGAL'].includes(s)) status = 'FAILED';
+  console.log('[gateway:callback] PARSE', JSON.stringify({ partnerRef, status, amount: body.amount ?? null }));
   return { partnerRef, status, amount: body.amount, raw: body };
 }
 
