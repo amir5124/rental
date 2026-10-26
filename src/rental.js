@@ -7,14 +7,20 @@ const { sendWhatsApp } = require('./notify');
 
 const r = express.Router();
 const BANKS = ['BCA', 'BNI', 'BRI', 'MANDIRI'];
+const MAX_DAYS = 30;
 const wita = () => new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10); // tanggal hari ini (WITA)
 const genId = () => 'RM-' + new Date().toISOString().slice(2, 10).replace(/-/g, '') + '-' + crypto.randomBytes(3).toString('hex').toUpperCase();
 const clean = (v, max) => String(v ?? '').trim().replace(/\s+/g, ' ').slice(0, max);
+
+// "2026-10-27" + 3 hari -> tanggal terakhir sewa "2026-10-29"
+const endDate = (iso, days) => { const d = new Date(iso + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + days - 1); return d.toISOString().slice(0, 10); };
+const fmtDate = iso => String(iso).split('-').reverse().join('/');
 
 function validate(b) {
   const o = {
     name: clean(b.customer_name, 100), wa: String(b.whatsapp ?? '').replace(/[\s\-+]/g, ''),
     car: clean(b.car_code, 30), date: clean(b.date, 10), time: clean(b.time, 5),
+    days: parseInt(b.days, 10) || 1,
     pax: parseInt(b.passengers, 10), pickup: clean(b.pickup, 200), dest: clean(b.destination, 200),
     notes: clean(b.notes, 300), method: b.payment_method, bank: b.bank ? String(b.bank).toUpperCase() : null
   };
@@ -22,6 +28,7 @@ function validate(b) {
   if (!/^628\d{8,12}$/.test(o.wa)) return { error: 'Nomor WhatsApp tidak valid' };
   if (!/^\d{4}-\d{2}-\d{2}$/.test(o.date) || o.date < wita()) return { error: 'Tanggal pemakaian tidak valid' };
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(o.time)) return { error: 'Jam penjemputan tidak valid' };
+  if (!(o.days >= 1 && o.days <= MAX_DAYS)) return { error: `Lama sewa 1-${MAX_DAYS} hari` };
   if (!(o.pax >= 1 && o.pax <= 8)) return { error: 'Jumlah penumpang 1-8' };
   if (!o.pickup || !o.dest) return { error: 'Lokasi & tujuan wajib diisi' };
   if (!['QRIS', 'VA'].includes(o.method)) return { error: 'Metode pembayaran tidak valid' };
@@ -35,15 +42,16 @@ r.post('/order', rateLimit({ windowMs: 60000, max: 10, standardHeaders: true, le
   const { v, error } = validate(req.body || {});
   if (error) return res.status(400).json({ success: false, message: error });
   try {
-    const [[car]] = await pool.query('SELECT code, name, price_12h FROM rental_cars WHERE code=? AND active=1', [v.car]);
+    const [[car]] = await pool.query('SELECT code, name, price_12h, service FROM rental_cars WHERE code=? AND active=1', [v.car]);
     if (!car) return res.status(400).json({ success: false, message: 'Mobil tidak tersedia' });
 
-    const orderId = genId(), amount = car.price_12h; // harga SELALU dari DB
+    // Harga SELALU dari DB: harga per hari x lama sewa. (kolom price_12h = harga per hari)
+    const orderId = genId(), amount = Number(car.price_12h) * v.days;
     await pool.query(
-      `INSERT INTO rental_orders (order_id, customer_name, whatsapp, car_code, car_name, usage_date, pickup_time,
+      `INSERT INTO rental_orders (order_id, customer_name, whatsapp, car_code, car_name, service, usage_date, pickup_time, days,
         passengers, pickup_location, destination, notes, total_amount, payment_method, bank)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [orderId, v.name, v.wa, car.code, car.name, v.date, v.time, v.pax, v.pickup, v.dest, v.notes || null, amount, v.method, v.bank]);
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [orderId, v.name, v.wa, car.code, car.name, car.service, v.date, v.time, v.days, v.pax, v.pickup, v.dest, v.notes || null, amount, v.method, v.bank]);
 
     let p;
     try {
@@ -60,7 +68,7 @@ r.post('/order', rateLimit({ windowMs: 60000, max: 10, standardHeaders: true, le
 
     res.json({
       success: true, data: {
-        order_id: orderId, total: amount, expired_at: p.expiredAt.toISOString(),
+        order_id: orderId, total: amount, days: v.days, service: car.service, expired_at: p.expiredAt.toISOString(),
         bank: v.bank, va_number: p.vaNumber, qr_string: p.qrString, qr_image_url: p.qrImageUrl
       }
     });
@@ -97,20 +105,23 @@ async function markPaid(partnerRef, amount, logResult) {
 }
 
 // ---- Notifikasi WhatsApp: template pelanggan & admin (urutan variabel = urutan {{n}} di template Twilio) ----
+// Template tidak diubah: jenis layanan dimasukkan ke variabel "mobil", lama sewa ke variabel "jadwal".
 async function notifyPaid(orderId) {
   const [[o]] = await pool.query('SELECT * FROM rental_orders WHERE order_id=?', [orderId]);
   if (!o) return;
-  const tgl = o.usage_date.split('-').reverse().join('/'), jam = o.pickup_time.slice(0, 5);
+  const days = Number(o.days) || 1;
+  const tgl = fmtDate(o.usage_date), jam = o.pickup_time.slice(0, 5);
   const total = 'Rp ' + Number(o.total_amount).toLocaleString('id-ID');
-  const jadwal = `${tgl} ${jam}`;
+  const jadwal = days > 1 ? `${tgl} ${jam} s/d ${fmtDate(endDate(o.usage_date, days))} (${days} hari)` : `${tgl} ${jam} (1 hari)`;
+  const mobil = `${o.car_name} (${o.service === 'SELF' ? 'Tanpa Driver' : 'Dengan Driver'})`;
 
   // Template pelanggan: {{1}} nama, {{2}} no. pesanan, {{3}} mobil, {{4}} jadwal, {{5}} jemput, {{6}} tujuan, {{7}} total
-  const customerVars = { 1: o.customer_name, 2: o.order_id, 3: o.car_name, 4: jadwal, 5: o.pickup_location, 6: o.destination, 7: total };
+  const customerVars = { 1: o.customer_name, 2: o.order_id, 3: mobil, 4: jadwal, 5: o.pickup_location, 6: o.destination, 7: total };
   // Template admin: {{1}} no. pesanan, {{2}} nama, {{3}} WA, {{4}} mobil, {{5}} jadwal, {{6}} jemput, {{7}} tujuan, {{8}} penumpang, {{9}} catatan, {{10}} total
-  const adminVars = { 1: o.order_id, 2: o.customer_name, 3: o.whatsapp, 4: o.car_name, 5: jadwal, 6: o.pickup_location, 7: o.destination, 8: o.passengers, 9: o.notes, 10: total };
+  const adminVars = { 1: o.order_id, 2: o.customer_name, 3: o.whatsapp, 4: mobil, 5: jadwal, 6: o.pickup_location, 7: o.destination, 8: o.passengers, 9: o.notes, 10: total };
 
   // Cadangan teks biasa bila SID template tidak diisi
-  const body = `Pembayaran berhasil ✅\nNo. Pesanan: ${o.order_id}\nNama: ${o.customer_name}\nMobil: ${o.car_name}\nJadwal: ${jadwal}\nJemput: ${o.pickup_location}\nTujuan: ${o.destination}\nTotal: ${total}\n\nTerima kasih, LinkU.`;
+  const body = `Pembayaran berhasil ✅\nNo. Pesanan: ${o.order_id}\nNama: ${o.customer_name}\nMobil: ${mobil}\nJadwal: ${jadwal}\nJemput: ${o.pickup_location}\nTujuan: ${o.destination}\nTotal: ${total}\n\nTerima kasih, LinkU.`;
 
   const admins = (process.env.ADMIN_WA || '6281347423737').split(',').map(x => x.trim()).filter(Boolean);
   const jobs = [

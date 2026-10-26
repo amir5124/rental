@@ -48,8 +48,8 @@ r.get('/summary', async (_req, res) => {
             `SELECT COUNT(*) AS n, COALESCE(SUM(total_amount),0) AS total FROM rental_orders
        WHERE status='PAID' AND DATE(DATE_ADD(paid_at, INTERVAL 7 HOUR)) = ${TODAY_WIB}`);
         const [upcoming] = await pool.query(
-            `SELECT order_id, customer_name, whatsapp, car_name, usage_date, pickup_time, passengers, pickup_location, destination, notes
-       FROM rental_orders WHERE status='PAID' AND usage_date >= ${TODAY_WIB}
+            `SELECT order_id, customer_name, whatsapp, car_name, service, days, usage_date, DATE_ADD(usage_date, INTERVAL days - 1 DAY) AS end_date, pickup_time, passengers, pickup_location, destination, notes
+       FROM rental_orders WHERE status='PAID' AND DATE_ADD(usage_date, INTERVAL days - 1 DAY) >= ${TODAY_WIB}
        ORDER BY usage_date ASC, pickup_time ASC LIMIT 20`);
         const stat = Object.fromEntries(STATUSES.map(s => [s, { n: 0, total: 0 }]));
         byStatus.forEach(x => { if (stat[x.status]) stat[x.status] = { n: Number(x.n), total: Number(x.total) }; });
@@ -78,7 +78,8 @@ r.get('/orders', async (req, res) => {
         const [[c]] = await pool.query(`SELECT COUNT(*) AS n, COALESCE(SUM(CASE WHEN o.status='PAID' THEN o.total_amount END),0) AS paid_total FROM rental_orders o ${w}`, args);
         // order_id berawalan tanggal (RM-YYMMDD-...), jadi urut DESC = terbaru dulu
         const [rows] = await pool.query(
-            `SELECT o.order_id, o.customer_name, o.whatsapp, o.car_code, o.car_name, o.usage_date, o.pickup_time, o.passengers,
+            `SELECT o.order_id, o.customer_name, o.whatsapp, o.car_code, o.car_name, o.service, o.days, o.usage_date,
+              DATE_ADD(o.usage_date, INTERVAL o.days - 1 DAY) AS end_date, o.pickup_time, o.passengers,
               o.pickup_location, o.destination, o.notes, o.total_amount, o.payment_method, o.bank, o.status, o.paid_at
        FROM rental_orders o ${w} ORDER BY o.order_id DESC LIMIT ? OFFSET ?`, [...args, limit, offset]);
         res.json({ success: true, data: { total: Number(c.n), paid_total: Number(c.paid_total), limit, offset, rows } });
